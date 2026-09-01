@@ -1,50 +1,61 @@
-"""Transport-independent Linker session boundary.
+"""Transport-independent server boundary for OpenHDO Linker sessions.
 
-The boundary accepts and returns JSON-shaped mappings. Authentication and the
-transport that carries those mappings are intentionally owned by callers.
+Wire messages are the v1 envelope from ``server/contracts/v1``. Authentication
+and transport remain caller-owned; this module receives the authenticated
+source when a local session is opened.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+import json
 import math
 import re
 import time
-import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
+from uuid import UUID, uuid4
 
 
-SCHEMA = "openhdo.linker/1"
-_PROTOCOL_NAME = "openhdo-linker"
-_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_VERSION_PATTERN = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+PROTOCOL_VERSION = 1
+LINK_REGISTER = "link.register"
+LINK_REGISTERED = "link.registered"
+LINK_HEARTBEAT = "link.heartbeat"
+LINK_HEARTBEAT_ACK = "link.heartbeat.ack"
+LIGHT_COMMAND = "light.command"
+LIGHT_EVENT = "light.event"
+COMMAND_RESULT = "command.result"
+COMMAND_ACK = "command.ack"
+
+_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+_IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9._-]{1,63}$")
+_SEMVER_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 
 
 class BoundaryError(Exception):
     """Base error raised by the Linker boundary."""
 
 
-class ValidationError(BoundaryError, ValueError):
-    """A message or public method argument failed validation."""
+class ProtocolError(BoundaryError, ValueError):
+    """A v1 envelope, manifest, or message payload is invalid."""
+
+
+class ValidationError(ProtocolError):
+    """Backward-compatible name for boundary validation failures."""
 
 
 class InvalidTransition(BoundaryError):
-    """An operation is not valid for the session's current state."""
-
-
-class ProtocolNegotiationError(BoundaryError):
-    """No protocol version is shared by the Linker and server."""
+    """An operation is not valid for a session's current state."""
 
 
 class CommandCorrelationError(BoundaryError):
-    """A command reply cannot be safely correlated to an issued command."""
+    """A command result cannot be safely correlated to an issued command."""
 
 
 class SessionState(str, Enum):
-    NEW = "new"
-    NEGOTIATING = "negotiating"
+    AUTHENTICATED = "authenticated"
     REGISTERED = "registered"
     ACTIVE = "active"
     STALE = "stale"
@@ -58,107 +69,145 @@ class HealthState(str, Enum):
     OFFLINE = "offline"
 
 
-@dataclass(frozen=True, slots=True, order=True)
-class ProtocolVersion:
-    """A major/minor protocol version advertised during negotiation."""
-
-    major: int
-    minor: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.major, int) or isinstance(self.major, bool) or self.major < 0:
-            raise ValidationError("protocol major must be a non-negative integer")
-        if not isinstance(self.minor, int) or isinstance(self.minor, bool) or self.minor < 0:
-            raise ValidationError("protocol minor must be a non-negative integer")
-
-    @classmethod
-    def parse(cls, value: Any) -> "ProtocolVersion":
-        if not isinstance(value, str) or not _VERSION_PATTERN.fullmatch(value):
-            raise ValidationError(f"invalid protocol version: {value!r}")
-        major, minor = (int(part) for part in value.split("."))
-        return cls(major, minor)
-
-    def __str__(self) -> str:
-        return f"{self.major}.{self.minor}"
-
-
 @dataclass(frozen=True, slots=True)
-class DeviceManifest:
-    device_id: str
-    kind: str
-    name: str
-    capabilities: tuple[str, ...] = ()
+class Envelope:
+    """Validated OpenHDO v1 Message Envelope."""
+
+    type: str
+    source: str
+    payload: Mapping[str, Any]
+    id: UUID = field(default_factory=uuid4)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    correlation_id: UUID | None = None
+    version: int = PROTOCOL_VERSION
 
     def __post_init__(self) -> None:
-        _validate_id(self.device_id, "device_id")
-        _validate_text(self.kind, "kind", 64)
-        _validate_text(self.name, "name", 128)
-        _validate_strings(self.capabilities, "device capabilities", 64)
+        if type(self.version) is not int or self.version != PROTOCOL_VERSION:
+            raise ProtocolError(f"unsupported protocol version: {self.version!r}")
+        if not isinstance(self.id, UUID):
+            raise ProtocolError("id must be a UUID")
+        if self.correlation_id is not None and not isinstance(self.correlation_id, UUID):
+            raise ProtocolError("correlation_id must be a UUID")
+        if not isinstance(self.type, str) or not _TYPE_PATTERN.fullmatch(self.type):
+            raise ProtocolError("type must be a lowercase domain name")
+        if not isinstance(self.source, str) or not self.source or len(self.source) > 128:
+            raise ProtocolError("source must contain 1 to 128 characters")
+        if not isinstance(self.payload, Mapping):
+            raise ProtocolError("payload must be an object")
+        _validate_json(self.payload, "payload")
+        if not isinstance(self.timestamp, datetime) or self.timestamp.tzinfo is None:
+            raise ProtocolError("timestamp must include a timezone")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "v": self.version,
+            "id": str(self.id),
+            "type": self.type,
+            "ts": self.timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "source": self.source,
+            "payload": dict(self.payload),
+        }
+        if self.correlation_id is not None:
+            data["correlation_id"] = str(self.correlation_id)
+        return data
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), separators=(",", ":"), sort_keys=True, allow_nan=False)
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "DeviceManifest":
+    def from_dict(cls, data: Mapping[str, Any]) -> "Envelope":
+        if not isinstance(data, Mapping):
+            raise ProtocolError("envelope must be an object")
+        required = {"v", "id", "type", "ts", "source", "payload"}
+        allowed = required | {"correlation_id"}
+        missing = required - set(data)
+        unknown = set(data) - allowed
+        if missing:
+            raise ProtocolError(f"envelope is missing fields: {sorted(missing)!r}")
+        if unknown:
+            raise ProtocolError(f"unknown envelope fields: {sorted(unknown)!r}")
+        if type(data["v"]) is not int or data["v"] != PROTOCOL_VERSION:
+            raise ProtocolError(f"unsupported protocol version: {data['v']!r}")
+        payload = data["payload"]
         if not isinstance(payload, Mapping):
-            raise ValidationError("device manifest must be an object")
+            raise ProtocolError("payload must be an object")
+        correlation = (
+            None
+            if "correlation_id" not in data
+            else _parse_uuid(data["correlation_id"], "correlation_id")
+        )
         return cls(
-            device_id=_required(payload, "device_id"),
-            kind=_required(payload, "kind"),
-            name=_required(payload, "name"),
-            capabilities=_string_sequence(payload.get("capabilities", ()), "device capabilities"),
+            type=data["type"],
+            source=data["source"],
+            payload=payload,
+            id=_parse_uuid(data["id"], "id"),
+            timestamp=_parse_timestamp(data["ts"]),
+            correlation_id=correlation,
         )
 
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "device_id": self.device_id,
-            "kind": self.kind,
-            "name": self.name,
-            "capabilities": list(self.capabilities),
-        }
+    @classmethod
+    def from_json(cls, value: str | bytes) -> "Envelope":
+        try:
+            data = json.loads(value)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ProtocolError("envelope must contain valid JSON") from error
+        if not isinstance(data, Mapping):
+            raise ProtocolError("envelope must be an object")
+        return cls.from_dict(data)
 
 
 @dataclass(frozen=True, slots=True)
 class LinkerManifest:
-    linker_id: str
-    name: str
+    """The v1 ``link.register`` payload."""
+
+    id: str
     version: str
-    devices: tuple[DeviceManifest, ...] = ()
-    capabilities: tuple[str, ...] = ()
+    name: str
+    transports: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _validate_id(self.linker_id, "linker_id")
+        _validate_identifier(self.id, "id")
+        if not isinstance(self.version, str) or not _SEMVER_PATTERN.fullmatch(self.version):
+            raise ProtocolError("version must use semantic versioning")
         _validate_text(self.name, "name", 128)
-        _validate_text(self.version, "version", 64)
-        _validate_strings(self.capabilities, "capabilities", 64)
-        if not isinstance(self.devices, Sequence) or isinstance(self.devices, (str, bytes)):
-            raise ValidationError("devices must be an array")
-        if any(not isinstance(device, DeviceManifest) for device in self.devices):
-            raise ValidationError("devices must contain DeviceManifest values")
-        device_ids = [device.device_id for device in self.devices]
-        if len(device_ids) != len(set(device_ids)):
-            raise ValidationError("device_id values must be unique")
+        if not isinstance(self.transports, tuple):
+            raise ProtocolError("transports must be a tuple")
+        if any(not isinstance(transport, str) or not _IDENTIFIER_PATTERN.fullmatch(transport) for transport in self.transports):
+            raise ProtocolError("transports must be lowercase identifiers")
+        if len(set(self.transports)) != len(self.transports):
+            raise ProtocolError("transports must be unique")
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "LinkerManifest":
         if not isinstance(payload, Mapping):
-            raise ValidationError("manifest must be an object")
-        devices_value = payload.get("devices", ())
-        if not isinstance(devices_value, Sequence) or isinstance(devices_value, (str, bytes)):
-            raise ValidationError("manifest devices must be an array")
+            raise ProtocolError("link.register payload must be an object")
+        expected = {"id", "version", "name", "transports"}
+        missing = expected - set(payload)
+        unknown = set(payload) - expected
+        if missing:
+            raise ProtocolError(f"manifest is missing fields: {sorted(missing)!r}")
+        if unknown:
+            raise ProtocolError(f"unknown manifest fields: {sorted(unknown)!r}")
+        transports = payload["transports"]
+        if not isinstance(transports, Sequence) or isinstance(transports, (str, bytes)):
+            raise ProtocolError("transports must be an array")
         return cls(
-            linker_id=_required(payload, "linker_id"),
-            name=_required(payload, "name"),
-            version=_required(payload, "version"),
-            devices=tuple(DeviceManifest.from_payload(item) for item in devices_value),
-            capabilities=_string_sequence(payload.get("capabilities", ()), "capabilities"),
+            id=payload["id"],
+            version=payload["version"],
+            name=payload["name"],
+            transports=tuple(transports),
         )
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "linker_id": self.linker_id,
-            "name": self.name,
+            "id": self.id,
             "version": self.version,
-            "capabilities": list(self.capabilities),
-            "devices": [device.to_payload() for device in self.devices],
+            "name": self.name,
+            "transports": list(self.transports),
         }
+
+    def registration(self, source: str) -> Envelope:
+        return Envelope(LINK_REGISTER, source, self.to_payload())
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,29 +215,39 @@ class BoundaryEvent:
     event_type: str
     session_id: str
     at: float
-    linker_id: str | None = None
+    source: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
+class IssuedCommand:
+    """Local dispatch context plus its v1 wire envelope."""
+
+    session_id: str
+    envelope: Envelope
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.envelope.to_dict()
+
+
+@dataclass(frozen=True, slots=True)
 class CommandCompletion:
-    command_id: str
-    linker_id: str
+    command_id: UUID
+    source: str
     device_id: str
     status: str
     result: Any = None
     error: str | None = None
-    duplicate: bool = False
 
 
 @dataclass(slots=True)
 class _Session:
     session_id: str
+    authenticated_source: str
     opened_at: float
-    state: SessionState = SessionState.NEW
+    state: SessionState = SessionState.AUTHENTICATED
     health: HealthState = HealthState.UNKNOWN
-    protocol: ProtocolVersion | None = None
-    linker_id: str | None = None
+    source: str | None = None
     manifest: LinkerManifest | None = None
     registered_at: float | None = None
     last_heartbeat_at: float | None = None
@@ -197,16 +256,15 @@ class _Session:
 
 @dataclass(frozen=True, slots=True)
 class _PendingCommand:
-    command_id: str
-    linker_id: str
+    command_id: UUID
+    source: str
     device_id: str
     issued_session_id: str
     issued_at: float
 
 
 _ALLOWED_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
-    SessionState.NEW: frozenset({SessionState.NEGOTIATING, SessionState.CLOSED}),
-    SessionState.NEGOTIATING: frozenset({SessionState.REGISTERED, SessionState.CLOSED}),
+    SessionState.AUTHENTICATED: frozenset({SessionState.REGISTERED, SessionState.CLOSED}),
     SessionState.REGISTERED: frozenset({SessionState.ACTIVE, SessionState.STALE, SessionState.CLOSED}),
     SessionState.ACTIVE: frozenset({SessionState.STALE, SessionState.CLOSED}),
     SessionState.STALE: frozenset({SessionState.ACTIVE, SessionState.CLOSED}),
@@ -215,74 +273,72 @@ _ALLOWED_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
 
 
 class LinkerBoundary:
-    """Owns Linker identity, registration, liveness, and command correlation.
-
-    ``handle`` is the versioned message boundary. It does not read sockets,
-    perform authentication, or talk to device drivers.
-    """
+    """Session, manifest, liveness, and command-correlation service layer."""
 
     def __init__(
         self,
         *,
-        supported_protocols: Iterable[ProtocolVersion | str] = ("1.0",),
+        server_source: str = "server",
         heartbeat_timeout_seconds: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         event_sink: Callable[[BoundaryEvent], None] | None = None,
         completed_command_limit: int = 1024,
     ) -> None:
-        protocols = tuple(
-            value if isinstance(value, ProtocolVersion) else ProtocolVersion.parse(value)
-            for value in supported_protocols
-        )
-        if not protocols:
-            raise ValidationError("at least one supported protocol is required")
-        if len(protocols) != len(set(protocols)):
-            raise ValidationError("supported protocols must be unique")
+        _validate_text(server_source, "server_source", 128)
         if heartbeat_timeout_seconds <= 0 or not math.isfinite(heartbeat_timeout_seconds):
             raise ValidationError("heartbeat timeout must be a positive finite number")
         if not isinstance(completed_command_limit, int) or isinstance(completed_command_limit, bool):
             raise ValidationError("completed command limit must be an integer")
         if completed_command_limit < 1:
             raise ValidationError("completed command limit must be at least one")
-
-        self.supported_protocols = tuple(sorted(protocols, reverse=True))
+        self.protocol_version = PROTOCOL_VERSION
+        self.server_source = server_source
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self._clock = clock
+        self._wall_clock = wall_clock
         self._event_sink = event_sink or (lambda event: None)
         self._completed_command_limit = completed_command_limit
         self._sessions: dict[str, _Session] = {}
-        self._current_by_linker: dict[str, str] = {}
+        self._current_by_source: dict[str, str] = {}
         self._manifests: dict[str, LinkerManifest] = {}
-        self._pending_commands: dict[str, _PendingCommand] = {}
-        self._completed_commands: dict[str, CommandCompletion] = {}
+        self._pending_commands: dict[UUID, _PendingCommand] = {}
+        self._completed_commands: dict[UUID, CommandCompletion] = {}
 
-    def open_session(self, *, now: float | None = None) -> str:
-        """Allocate a server-side session ID for one authenticated connection."""
+    def open_session(self, *, authenticated_source: str, now: float | None = None) -> str:
+        """Open a local session for a source already authenticated by the caller."""
+        _validate_text(authenticated_source, "authenticated_source", 128)
         at = self._now(now)
-        session_id = f"ses_{uuid.uuid4().hex}"
-        self._sessions[session_id] = _Session(session_id=session_id, opened_at=at)
-        self._emit("session.opened", self._sessions[session_id], at)
+        session_id = f"ses_{uuid4().hex}"
+        session = _Session(
+            session_id=session_id,
+            authenticated_source=authenticated_source,
+            opened_at=at,
+        )
+        self._sessions[session_id] = session
+        self._emit("link.session.opened", session, at)
         return session_id
 
-    def handle(self, message: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
-        """Validate and route one versioned inbound protocol message."""
-        if not isinstance(message, Mapping):
-            raise ValidationError("message must be an object")
-        if message.get("schema") != SCHEMA:
-            raise ValidationError(f"schema must be {SCHEMA!r}")
-        message_type = message.get("type")
-        if message_type not in {"hello", "register", "heartbeat", "command_reply"}:
-            raise ValidationError(f"unsupported message type: {message_type!r}")
-        session_id = _required(message, "session_id")
-        _validate_id(session_id, "session_id")
+    def handle(
+        self,
+        session_id: str,
+        message: Mapping[str, Any] | Envelope,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Validate and route one v1 envelope in a session context."""
+        envelope = message if isinstance(message, Envelope) else Envelope.from_dict(message)
+        session = self._get_session(session_id)
         at = self._now(now)
-        if message_type == "hello":
-            return self._handle_hello(session_id, message, at)
-        if message_type == "register":
-            return self._handle_register(session_id, message, at)
-        if message_type == "heartbeat":
-            return self._handle_heartbeat(session_id, message, at)
-        return self._handle_command_reply(session_id, message, at)
+        if envelope.source != session.authenticated_source:
+            raise ProtocolError("envelope source does not match authenticated session source")
+        if envelope.type == LINK_REGISTER:
+            return self._handle_register(session, envelope, at)
+        if envelope.type == LINK_HEARTBEAT:
+            return self._handle_heartbeat(session, envelope, at)
+        if envelope.type == COMMAND_RESULT:
+            return self._handle_command_result(session, envelope, at)
+        raise ProtocolError(f"unsupported Linker message type: {envelope.type!r}")
 
     def issue_command(
         self,
@@ -291,68 +347,54 @@ class LinkerBoundary:
         device_id: str,
         name: str,
         args: Mapping[str, Any] | None = None,
-        command_id: str | None = None,
+        command_id: UUID | str | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
-        """Create a correlated command for the current healthy Linker session."""
-        _validate_id(linker_id, "linker_id")
-        _validate_id(device_id, "device_id")
+    ) -> IssuedCommand:
+        """Create a v1 ``light.command`` with a bounded local pending store."""
+        _validate_identifier(linker_id, "linker_id")
+        _validate_text(device_id, "device_id", 128)
         _validate_text(name, "command name", 128)
-        if args is None:
-            command_args: dict[str, Any] = {}
-        elif isinstance(args, Mapping):
-            command_args = dict(args)
-        else:
+        command_args = {} if args is None else dict(args) if isinstance(args, Mapping) else None
+        if command_args is None:
             raise ValidationError("command args must be an object")
         _validate_json(command_args, "command args")
-
         session = self._current_session(linker_id)
         if session.state is not SessionState.ACTIVE or session.health is not HealthState.HEALTHY:
             raise InvalidTransition("commands require an active healthy Linker session")
-        manifest = session.manifest
-        assert manifest is not None
-        if device_id not in {device.device_id for device in manifest.devices}:
-            raise ValidationError(f"unknown device_id: {device_id!r}")
-
-        at = self._now(now)
-        resolved_command_id = command_id or f"cmd_{uuid.uuid4().hex}"
-        _validate_id(resolved_command_id, "command_id")
+        resolved_command_id = uuid4() if command_id is None else _parse_uuid(command_id, "command_id")
         if resolved_command_id in self._pending_commands or resolved_command_id in self._completed_commands:
-            raise CommandCorrelationError(f"command_id already exists: {resolved_command_id!r}")
+            raise CommandCorrelationError(f"command_id already exists: {resolved_command_id}")
+        at = self._now(now)
+        envelope = Envelope(
+            type=LIGHT_COMMAND,
+            source=self.server_source,
+            payload={"device_id": device_id, "command": name, "args": command_args},
+            id=resolved_command_id,
+            timestamp=self._timestamp(),
+        )
         self._pending_commands[resolved_command_id] = _PendingCommand(
             command_id=resolved_command_id,
-            linker_id=linker_id,
+            source=linker_id,
             device_id=device_id,
             issued_session_id=session.session_id,
             issued_at=at,
         )
         self._emit(
-            "command.issued",
+            "light.command.issued",
             session,
             at,
-            {"command_id": resolved_command_id, "device_id": device_id, "name": name},
+            {"command_id": str(resolved_command_id), "device_id": device_id, "name": name},
         )
-        return {
-            "schema": SCHEMA,
-            "type": "command",
-            "protocol_name": _PROTOCOL_NAME,
-            "protocol": str(session.protocol),
-            "session_id": session.session_id,
-            "linker_id": linker_id,
-            "device_id": device_id,
-            "command_id": resolved_command_id,
-            "name": name,
-            "args": command_args,
-        }
+        return IssuedCommand(session_id=session.session_id, envelope=envelope)
 
     def check_health(self, *, now: float | None = None) -> tuple[dict[str, Any], ...]:
-        """Mark current sessions stale when their heartbeat deadline expires."""
+        """Mark current sessions stale after their heartbeat deadline expires."""
         at = self._now(now)
         changed: list[dict[str, Any]] = []
         for session in tuple(self._sessions.values()):
             if session.state not in {SessionState.REGISTERED, SessionState.ACTIVE, SessionState.STALE}:
                 continue
-            if session.linker_id is None or self._current_by_linker.get(session.linker_id) != session.session_id:
+            if session.source is None or self._current_by_source.get(session.source) != session.session_id:
                 continue
             heartbeat_base = (
                 session.last_heartbeat_at
@@ -364,49 +406,52 @@ class LinkerBoundary:
             if session.state is not SessionState.STALE:
                 self._transition(session, SessionState.STALE, "heartbeat_timeout", at)
             self._set_health(session, HealthState.STALE, at, "heartbeat_timeout")
-            changed.append(self.status(session.linker_id, now=at))
+            changed.append(self.status(session.source, now=at))
         return tuple(changed)
 
-    def close_session(self, session_id: str, *, now: float | None = None, reason: str = "closed") -> None:
-        """Close a session and leave its stable identity visible as offline."""
-        _validate_id(session_id, "session_id")
+    def close_session(
+        self,
+        session_id: str,
+        *,
+        now: float | None = None,
+        reason: str = "closed",
+    ) -> None:
+        """Close a session and retain its stable identity as offline."""
+        _validate_text(session_id, "session_id", 128)
+        _validate_text(reason, "close reason", 128)
         session = self._get_session(session_id)
         at = self._now(now)
         if session.state is SessionState.CLOSED:
             return
         self._transition(session, SessionState.CLOSED, reason, at)
         self._set_health(session, HealthState.OFFLINE, at, reason)
-        if session.linker_id and self._current_by_linker.get(session.linker_id) == session_id:
-            del self._current_by_linker[session.linker_id]
+        if session.source and self._current_by_source.get(session.source) == session_id:
+            del self._current_by_source[session.source]
 
     def status(self, linker_id: str, *, now: float | None = None) -> dict[str, Any]:
-        """Return the server's current registry view for one stable Linker ID."""
-        _validate_id(linker_id, "linker_id")
+        """Return the internal registry view for one stable Linker ID."""
+        _validate_identifier(linker_id, "linker_id")
         manifest = self._manifests.get(linker_id)
         if manifest is None:
             raise ValidationError(f"unknown linker_id: {linker_id!r}")
-        session_id = self._current_by_linker.get(linker_id)
+        session_id = self._current_by_source.get(linker_id)
         session = self._sessions.get(session_id) if session_id else None
         at = self._now(now)
         if session is None:
             return {
-                "schema": SCHEMA,
-                "linker_id": linker_id,
+                "id": linker_id,
                 "manifest": manifest.to_payload(),
                 "session_id": None,
                 "state": SessionState.CLOSED.value,
                 "health": HealthState.OFFLINE.value,
-                "protocol": None,
                 "last_heartbeat_sequence": 0,
             }
         return {
-            "schema": SCHEMA,
-            "linker_id": linker_id,
+            "id": linker_id,
             "manifest": manifest.to_payload(),
             "session_id": session.session_id,
             "state": session.state.value,
             "health": session.health.value,
-            "protocol": str(session.protocol) if session.protocol else None,
             "last_heartbeat_sequence": session.last_heartbeat_sequence,
             "heartbeat_age_seconds": (
                 None
@@ -419,171 +464,166 @@ class LinkerBoundary:
         """Return all known stable identities, including offline Linkers."""
         return tuple(self.status(linker_id, now=now) for linker_id in sorted(self._manifests))
 
-    def _handle_hello(self, session_id: str, message: Mapping[str, Any], at: float) -> dict[str, Any]:
-        session = self._get_session(session_id)
-        self._require_state(session, {SessionState.NEW})
-        if message.get("protocol_name") != _PROTOCOL_NAME:
-            raise ValidationError(f"protocol_name must be {_PROTOCOL_NAME!r}")
-        versions = message.get("protocol_versions")
-        if not isinstance(versions, Sequence) or isinstance(versions, (str, bytes)) or not versions:
-            raise ValidationError("protocol_versions must be a non-empty array")
-        offered = tuple(ProtocolVersion.parse(value) for value in versions)
-        if len(offered) != len(set(offered)):
-            raise ValidationError("protocol_versions must be unique")
-        selected = self._select_protocol(offered)
-        session.protocol = selected
-        self._transition(session, SessionState.NEGOTIATING, "protocol_negotiated", at)
-        return {
-            "schema": SCHEMA,
-            "type": "hello_ack",
-            "session_id": session_id,
-            "protocol_name": _PROTOCOL_NAME,
-            "protocol": str(selected),
-            "heartbeat_timeout_seconds": self.heartbeat_timeout_seconds,
-        }
-
-    def _handle_register(self, session_id: str, message: Mapping[str, Any], at: float) -> dict[str, Any]:
-        session = self._get_session(session_id)
-        self._require_state(session, {SessionState.NEGOTIATING})
-        manifest = LinkerManifest.from_payload(_required(message, "manifest"))
-        old_session_id = self._current_by_linker.get(manifest.linker_id)
-        if old_session_id and old_session_id != session_id:
+    def _handle_register(self, session: _Session, envelope: Envelope, at: float) -> dict[str, Any]:
+        self._require_state(session, {SessionState.AUTHENTICATED})
+        manifest = LinkerManifest.from_payload(envelope.payload)
+        if manifest.id != session.authenticated_source:
+            raise ProtocolError("manifest id does not match authenticated session source")
+        old_session_id = self._current_by_source.get(manifest.id)
+        if old_session_id and old_session_id != session.session_id:
             old_session = self._get_session(old_session_id)
             self._transition(old_session, SessionState.CLOSED, "reconnected", at)
             self._set_health(old_session, HealthState.OFFLINE, at, "reconnected")
-        session.linker_id = manifest.linker_id
+        session.source = manifest.id
         session.manifest = manifest
         session.registered_at = at
         session.last_heartbeat_at = None
         session.last_heartbeat_sequence = 0
-        self._manifests[manifest.linker_id] = manifest
-        self._current_by_linker[manifest.linker_id] = session_id
+        self._manifests[manifest.id] = manifest
+        self._current_by_source[manifest.id] = session.session_id
         self._transition(session, SessionState.REGISTERED, "manifest_registered", at)
         self._emit(
-            "linker.registered",
+            "link.registered",
             session,
             at,
-            {"device_count": len(manifest.devices), "manifest_version": manifest.version},
+            {"manifest_id": manifest.id, "transport_count": len(manifest.transports)},
         )
-        return {
-            "schema": SCHEMA,
-            "type": "register_ack",
-            "session_id": session_id,
-            "linker_id": manifest.linker_id,
-            "protocol_name": _PROTOCOL_NAME,
-            "protocol": str(session.protocol),
-            "state": session.state.value,
-            "health": session.health.value,
-            "heartbeat_timeout_seconds": self.heartbeat_timeout_seconds,
-        }
+        return self._response(
+            LINK_REGISTERED,
+            {
+                "id": manifest.id,
+                "heartbeat_timeout_seconds": self.heartbeat_timeout_seconds,
+            },
+            correlation_id=envelope.id,
+        )
 
-    def _handle_heartbeat(self, session_id: str, message: Mapping[str, Any], at: float) -> dict[str, Any]:
-        session = self._get_session(session_id)
+    def _handle_heartbeat(self, session: _Session, envelope: Envelope, at: float) -> dict[str, Any]:
+        self._require_current(session)
         self._require_state(session, {SessionState.REGISTERED, SessionState.ACTIVE, SessionState.STALE})
-        linker_id = _required(message, "linker_id")
-        _validate_id(linker_id, "linker_id")
-        if session.linker_id != linker_id:
-            raise ValidationError("heartbeat linker_id does not match the session identity")
-        sequence = message.get("sequence")
+        sequence = envelope.payload.get("sequence")
         if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
-            raise ValidationError("heartbeat sequence must be a positive integer")
-        if sequence <= session.last_heartbeat_sequence:
-            self._emit("heartbeat.duplicate", session, at, {"sequence": sequence})
-            return {
-                "schema": SCHEMA,
-                "type": "heartbeat_ack",
-                "session_id": session_id,
-                "linker_id": linker_id,
+            raise ProtocolError("heartbeat sequence must be a positive integer")
+        duplicate = sequence <= session.last_heartbeat_sequence
+        if duplicate:
+            self._emit("link.heartbeat.duplicate", session, at, {"sequence": sequence})
+        else:
+            session.last_heartbeat_sequence = sequence
+            session.last_heartbeat_at = at
+            if session.state is not SessionState.ACTIVE:
+                self._transition(session, SessionState.ACTIVE, "heartbeat_received", at)
+            self._set_health(session, HealthState.HEALTHY, at, "heartbeat_received")
+            self._emit("link.heartbeat.received", session, at, {"sequence": sequence})
+        return self._response(
+            LINK_HEARTBEAT_ACK,
+            {
+                "id": session.source,
                 "sequence": session.last_heartbeat_sequence,
-                "duplicate": True,
+                "duplicate": duplicate,
                 "state": session.state.value,
                 "health": session.health.value,
-            }
-        session.last_heartbeat_sequence = sequence
-        session.last_heartbeat_at = at
-        if session.state is not SessionState.ACTIVE:
-            self._transition(session, SessionState.ACTIVE, "heartbeat_received", at)
-        self._set_health(session, HealthState.HEALTHY, at, "heartbeat_received")
-        self._emit("heartbeat.received", session, at, {"sequence": sequence})
-        return {
-            "schema": SCHEMA,
-            "type": "heartbeat_ack",
-            "session_id": session_id,
-            "linker_id": linker_id,
-            "sequence": sequence,
-            "duplicate": False,
-            "state": session.state.value,
-            "health": session.health.value,
-        }
+            },
+            correlation_id=envelope.id,
+        )
 
-    def _handle_command_reply(self, session_id: str, message: Mapping[str, Any], at: float) -> dict[str, Any]:
-        session = self._get_session(session_id)
+    def _handle_command_result(self, session: _Session, envelope: Envelope, at: float) -> dict[str, Any]:
+        self._require_current(session)
         self._require_state(session, {SessionState.REGISTERED, SessionState.ACTIVE, SessionState.STALE})
-        linker_id = _required(message, "linker_id")
-        device_id = _required(message, "device_id")
-        command_id = _required(message, "command_id")
-        _validate_id(linker_id, "linker_id")
-        _validate_id(device_id, "device_id")
-        _validate_id(command_id, "command_id")
-        if session.linker_id != linker_id or self._current_by_linker.get(linker_id) != session_id:
-            raise CommandCorrelationError("reply session is not the current session for linker_id")
-        status = message.get("status")
+        if envelope.correlation_id is None:
+            raise CommandCorrelationError("command.result requires correlation_id")
+        device_id = envelope.payload.get("device_id")
+        _validate_text(device_id, "device_id", 128)
+        status = envelope.payload.get("status")
         if status not in {"ok", "error"}:
-            raise ValidationError("reply status must be 'ok' or 'error'")
-        result = message.get("result")
-        error = message.get("error")
+            raise ProtocolError("command.result status must be 'ok' or 'error'")
+        result = envelope.payload.get("result")
+        error = envelope.payload.get("error")
         if status == "error":
-            _validate_text(error, "reply error", 512)
+            _validate_text(error, "command.result error", 512)
         elif error is not None:
-            raise ValidationError("successful reply cannot contain error")
-        _validate_json(result, "reply result")
+            raise ProtocolError("successful command.result cannot contain error")
+        _validate_json(result, "command.result result")
 
-        pending = self._pending_commands.get(command_id)
+        pending = self._pending_commands.get(envelope.correlation_id)
         if pending is None:
-            previous = self._completed_commands.get(command_id)
+            previous = self._completed_commands.get(envelope.correlation_id)
             if previous is None:
-                raise CommandCorrelationError(f"unknown command_id: {command_id!r}")
-            if previous.linker_id != linker_id or previous.device_id != device_id:
-                raise CommandCorrelationError("reply identity does not match completed command")
-            self._emit("command.duplicate_reply", session, at, {"command_id": command_id})
-            return _command_ack(previous, duplicate=True)
-        if pending.linker_id != linker_id or pending.device_id != device_id:
-            raise CommandCorrelationError("reply identity does not match pending command")
-
+                raise CommandCorrelationError(f"unknown command correlation_id: {envelope.correlation_id}")
+            if previous.source != session.source or previous.device_id != device_id:
+                raise CommandCorrelationError("command.result identity does not match completed command")
+            self._emit(
+                "command.result.duplicate",
+                session,
+                at,
+                {"command_id": str(previous.command_id)},
+            )
+            return self._command_ack(previous, envelope.id, duplicate=True)
+        if pending.source != session.source or pending.device_id != device_id:
+            raise CommandCorrelationError("command.result identity does not match pending command")
         completion = CommandCompletion(
-            command_id=command_id,
-            linker_id=linker_id,
+            command_id=pending.command_id,
+            source=pending.source,
             device_id=device_id,
             status=status,
             result=result,
             error=error,
         )
-        del self._pending_commands[command_id]
-        self._completed_commands[command_id] = completion
+        del self._pending_commands[pending.command_id]
+        self._completed_commands[pending.command_id] = completion
         while len(self._completed_commands) > self._completed_command_limit:
             del self._completed_commands[next(iter(self._completed_commands))]
         self._emit(
-            "command.completed",
+            "command.result.accepted",
             session,
             at,
-            {"command_id": command_id, "status": status, "issued_session_id": pending.issued_session_id},
+            {"command_id": str(pending.command_id), "issued_session_id": pending.issued_session_id},
         )
-        return _command_ack(completion, duplicate=False)
+        return self._command_ack(completion, envelope.id, duplicate=False)
 
-    def _select_protocol(self, offered: Sequence[ProtocolVersion]) -> ProtocolVersion:
-        shared = [version for version in self.supported_protocols if version in offered]
-        if not shared:
-            raise ProtocolNegotiationError(
-                f"no compatible protocol; offered={[str(value) for value in offered]!r}, "
-                f"supported={[str(value) for value in self.supported_protocols]!r}"
-            )
-        return max(shared)
+    def _command_ack(
+        self,
+        completion: CommandCompletion,
+        correlation_id: UUID,
+        *,
+        duplicate: bool,
+    ) -> dict[str, Any]:
+        return self._response(
+            COMMAND_ACK,
+            {
+                "command_id": str(completion.command_id),
+                "device_id": completion.device_id,
+                "status": completion.status,
+                "accepted": True,
+                "duplicate": duplicate,
+                "result": completion.result,
+                "error": completion.error,
+            },
+            correlation_id=correlation_id,
+        )
+
+    def _response(
+        self,
+        message_type: str,
+        payload: Mapping[str, Any],
+        *,
+        correlation_id: UUID,
+    ) -> dict[str, Any]:
+        return Envelope(
+            type=message_type,
+            source=self.server_source,
+            payload=payload,
+            correlation_id=correlation_id,
+            timestamp=self._timestamp(),
+        ).to_dict()
 
     def _current_session(self, linker_id: str) -> _Session:
-        session_id = self._current_by_linker.get(linker_id)
+        session_id = self._current_by_source.get(linker_id)
         if session_id is None:
             raise InvalidTransition(f"Linker is not registered: {linker_id!r}")
         return self._get_session(session_id)
+
+    def _require_current(self, session: _Session) -> None:
+        if session.source is None or self._current_by_source.get(session.source) != session.session_id:
+            raise InvalidTransition("session is no longer current for its Linker identity")
 
     def _get_session(self, session_id: str) -> _Session:
         try:
@@ -603,13 +643,11 @@ class LinkerBoundary:
         if target is session.state:
             return
         if target not in _ALLOWED_TRANSITIONS[session.state]:
-            raise InvalidTransition(
-                f"invalid transition {session.state.value!r} -> {target.value!r}"
-            )
+            raise InvalidTransition(f"invalid transition {session.state.value!r} -> {target.value!r}")
         previous = session.state
         session.state = target
         self._emit(
-            "session.state_changed",
+            "link.session.state_changed",
             session,
             at,
             {"from": previous.value, "to": target.value, "reason": reason},
@@ -621,7 +659,7 @@ class LinkerBoundary:
         previous = session.health
         session.health = target
         self._emit(
-            "session.health_changed",
+            "link.health.changed",
             session,
             at,
             {"from": previous.value, "to": target.value, "reason": reason},
@@ -639,7 +677,7 @@ class LinkerBoundary:
                 event_type=event_type,
                 session_id=session.session_id,
                 at=at,
-                linker_id=session.linker_id,
+                source=session.source or session.authenticated_source,
                 details=dict(details),
             )
         )
@@ -650,70 +688,62 @@ class LinkerBoundary:
             raise ValidationError("time must be a finite number")
         return float(value)
 
-
-def _command_ack(completion: CommandCompletion, *, duplicate: bool) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA,
-        "type": "command_ack",
-        "command_id": completion.command_id,
-        "linker_id": completion.linker_id,
-        "device_id": completion.device_id,
-        "status": completion.status,
-        "accepted": True,
-        "duplicate": duplicate,
-        "result": completion.result,
-        "error": completion.error,
-    }
+    def _timestamp(self) -> datetime:
+        value = self._wall_clock()
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValidationError("wall clock must return a timezone-aware datetime")
+        return value
 
 
-def _required(payload: Mapping[str, Any], name: str) -> Any:
-    if name not in payload:
-        raise ValidationError(f"missing required field: {name}")
-    return payload[name]
+def _parse_uuid(value: Any, field_name: str) -> UUID:
+    if isinstance(value, UUID):
+        return value
+    if not isinstance(value, str):
+        raise ProtocolError(f"{field_name} must be a UUID")
+    try:
+        return UUID(value)
+    except ValueError as error:
+        raise ProtocolError(f"{field_name} must be a UUID") from error
 
 
-def _validate_id(value: Any, field: str) -> None:
-    if not isinstance(value, str) or not _ID_PATTERN.fullmatch(value):
-        raise ValidationError(f"{field} must be a non-empty identifier (letters, digits, _ . : -)")
+def _parse_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ProtocolError("ts must be an ISO-8601 string")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        timestamp = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise ProtocolError("ts must be an ISO-8601 string") from error
+    if timestamp.tzinfo is None:
+        raise ProtocolError("ts must include a timezone")
+    return timestamp.astimezone(timezone.utc)
 
 
-def _validate_text(value: Any, field: str, max_length: int) -> None:
+def _validate_identifier(value: Any, field_name: str) -> None:
+    if not isinstance(value, str) or not _IDENTIFIER_PATTERN.fullmatch(value):
+        raise ProtocolError(f"{field_name} must be a lowercase identifier")
+
+
+def _validate_text(value: Any, field_name: str, max_length: int) -> None:
     if not isinstance(value, str) or not value.strip() or len(value) > max_length:
-        raise ValidationError(f"{field} must be non-empty text of at most {max_length} characters")
+        raise ProtocolError(f"{field_name} must contain 1 to {max_length} characters")
 
 
-def _validate_strings(values: Any, field: str, max_length: int) -> None:
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        raise ValidationError(f"{field} must be an array")
-    if any(not isinstance(value, str) or not value or len(value) > max_length for value in values):
-        raise ValidationError(f"{field} must contain non-empty strings of at most {max_length} characters")
-    if len(values) != len(set(values)):
-        raise ValidationError(f"{field} must not contain duplicates")
-
-
-def _string_sequence(value: Any, field: str) -> tuple[str, ...]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise ValidationError(f"{field} must be an array")
-    values = tuple(value)
-    _validate_strings(values, field, 64)
-    return values
-
-
-def _validate_json(value: Any, field: str) -> None:
+def _validate_json(value: Any, field_name: str) -> None:
     if value is None or isinstance(value, (str, bool, int)):
         return
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValidationError(f"{field} must contain only finite JSON numbers")
+            raise ProtocolError(f"{field_name} must contain only finite JSON numbers")
         return
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for item in value:
-            _validate_json(item, field)
+            _validate_json(item, field_name)
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValidationError(f"{field} object keys must be strings")
-            _validate_json(item, field)
+                raise ProtocolError(f"{field_name} object keys must be strings")
+            _validate_json(item, field_name)
         return
-    raise ValidationError(f"{field} contains a non-JSON value: {type(value).__name__}")
+    raise ProtocolError(f"{field_name} contains a non-JSON value: {type(value).__name__}")

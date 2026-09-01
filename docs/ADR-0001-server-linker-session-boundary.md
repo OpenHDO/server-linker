@@ -2,33 +2,59 @@
 
 ## Status
 
-Accepted
+Accepted; reconciled with `server/contracts/v1` on 2026-09-01.
 
 ## Decision
 
-The server boundary uses versioned JSON-shaped messages under `openhdo.linker/1`.
-It negotiates an exact `major.minor` protocol version during `hello`, validates
-the manifest before registration, and routes only four inbound message types:
-`hello`, `register`, `heartbeat`, and `command_reply`.
+The wire boundary uses the normative v1 Message Envelope exactly:
 
-Each connection receives a server-issued `session_id`. The Linker-provided
-`linker_id` is the stable registry identity, so reconnecting replaces the
-current session without creating a duplicate registry entry. Pending commands
-remain keyed by their server-issued `command_id`; a reply from the replacement
-session can therefore complete a command issued before reconnect.
+```json
+{
+  "v": 1,
+  "id": "uuid",
+  "type": "link.register",
+  "ts": "2026-01-01T00:00:00Z",
+  "source": "linker.example",
+  "payload": {}
+}
+```
 
-Session lifecycle and liveness are separate, explicit state machines. Sessions
-move through `new -> negotiating -> registered -> active`, can become `stale`
-when the heartbeat deadline expires, and end at `closed`. Health moves from
-`unknown` to `healthy`, `stale`, or `offline`. State and command events are
-emitted through an injected event sink for metrics and audit integration.
+The boundary does not add a `schema` or protocol namespace, and does not put
+session metadata at the top level. `Envelope` validates the v1 fields and
+major version before routing. The v1 `link-manifest` payload is also used
+without additions: `id`, semantic `version`, `name`, and unique lowercase
+`transports`.
+
+Authentication is an adapter concern. The adapter opens a local session with
+the already authenticated `authenticated_source`; every incoming envelope's
+`source` must match it, and registration requires `payload.id` to match it.
+The opaque `session_id` is local routing context and is never serialized into
+the v1 envelope. Reconnecting with the same stable manifest `id` replaces the
+current session without duplicating the registry identity.
+
+The v1 major version is the protocol negotiation boundary. There is no second
+`hello`/minor-version namespace: unsupported `v` values are rejected before
+payload processing, as required by the server contract.
+
+Heartbeats use `link.heartbeat` with a monotonic `sequence`; acknowledgements
+are v1 envelopes correlated to the heartbeat envelope `id`. Session lifecycle
+and liveness remain explicit: `authenticated -> registered -> active`, with
+`stale` and terminal `closed`; health is `unknown`, `healthy`, `stale`, or
+`offline`.
+
+Commands use `light.command` envelopes. The command envelope `id` is the
+Correlation Identifier. Linker results use `command.result` with that UUID in
+`correlation_id`; duplicate results are acknowledged from a bounded in-memory
+completed store. Pending commands remain across session replacement, so an
+authenticated reconnect can finish an in-flight command. `light.event` is
+reserved for the same v1 envelope and is not interpreted as a device driver.
 
 ## Consequences
 
-- Transport, authentication, device drivers, and driver-specific payloads stay
-  outside this repository.
-- The in-memory registry and bounded completed-command store are local-first and
-  suitable for a modular monolith; a later multi-process deployment must place
-  those stores behind a shared repository/message store.
-- Only exact versions currently supported by the server are negotiated. Adding
-  a protocol version requires adding its implementation and tests explicitly.
+- Transport, credentials, authorization policy, persistence, and physical
+  device drivers stay outside this repository.
+- The pending/completed stores provide only local in-process delivery and
+  idempotence. A multi-process deployment must replace them with a durable
+  repository/message store before claiming delivery across process failure.
+- Response envelopes use `correlation_id` for request-reply and have the server
+  source; session routing remains an adapter-side concern.

@@ -1,32 +1,35 @@
 # OpenHDO Server Linker
 
-`server-linker` is the server-side module for authenticated
-`openhdo-linker` sessions. It owns Linker registration, identity, locations,
-health, capabilities, device inventory, lifecycle, and command routing.
+`server-linker` is the server-side module for authenticated Linker sessions. It
+owns Linker registration, stable identity, health, lifecycle, and command
+routing; physical device drivers remain in the standalone Linker process.
 
-## Boundary
+## Contract boundary
 
-This module speaks the versioned Linker protocol. It does not contain Wi-Fi,
-Bluetooth, Zigbee, USB, serial, or device-specific drivers; those belong in
-the standalone [linker](https://github.com/OpenHDO/linker) process.
+Wire messages use the normative [server `contracts/v1`](https://github.com/OpenHDO/server/tree/master/contracts/v1)
+Message Envelope:
 
-## Status
+- required `v`, `id`, `type`, `ts`, `source`, and object `payload`;
+- optional `correlation_id` for command results and request-reply;
+- `v: 1` is the only supported protocol major;
+- `link.register` payloads are exactly `id`, `version`, `name`, and unique
+  lowercase `transports`.
 
-The first server-side session-boundary slice is implemented in the dependency-
-free `server_linker` package. It negotiates protocol `1.0`, validates and
-registers a manifest, tracks explicit session/health states, preserves stable
-`linker_id` identity across reconnects, and correlates idempotent command
-replies by server-issued `command_id`.
+The local `session_id` is supplied to `LinkerBoundary.handle()` by the
+transport/authentication adapter and never becomes a top-level wire field.
+`open_session(authenticated_source=...)` binds the session to the already
+authenticated envelope source. Reconnects replace the current session for the
+same manifest `id` while preserving pending command correlation.
 
-The boundary accepts JSON-shaped mappings and leaves authentication and
-transport adapters to the caller. Run its checks with:
+The boundary uses `light.command`, `command.result`, and v1 envelopes for
+future Light command/event integration. It does not implement transport or
+device drivers.
+
+Run the checks with:
 
 ```text
 python -m unittest discover -s tests -v
 ```
 
 See [ADR-0001](docs/ADR-0001-server-linker-session-boundary.md) for the
-identity, state, and command-correlation decisions.
-
-See the [project architecture](https://github.com/OpenHDO/about/blob/main/ARCHITECTURE.md)
-and [server contracts](https://github.com/OpenHDO/server/tree/master/contracts/v1).
+reconciliation and state decisions.
