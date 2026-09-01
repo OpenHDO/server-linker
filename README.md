@@ -1,8 +1,9 @@
 # OpenHDO Server Linker
 
-`server-linker` is the server-side module for authenticated Linker sessions. It
-owns Linker registration, stable identity, health, lifecycle, and command
-routing; physical device drivers remain in the standalone Linker process.
+`server-linker` is the server-side Python module boundary for authenticated
+Linker sessions. It owns Linker registration, stable identity, health,
+lifecycle, and command routing; physical device drivers remain in the
+standalone Linker process. It is not a gateway or runtime.
 
 ## Contract boundary
 
@@ -25,10 +26,12 @@ The boundary uses `light.command`, `command.result`, and v1 envelopes for
 future Light command/event integration. It does not implement transport or
 device drivers.
 
-Run the checks with:
+Install the package and run the checks from a clean checkout with:
 
-```text
+```sh
+python -m pip install .
 python -m unittest discover -s tests -v
+python -m compileall -q server_linker tests
 ```
 
 See [ADR-0001](docs/ADR-0001-server-linker-session-boundary.md) for the
